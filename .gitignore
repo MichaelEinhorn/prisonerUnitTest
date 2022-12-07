@@ -1,5 +1,9 @@
 .ipynb_checkpoints/
 __pycache__/
 *.swp
+*.png
+*.jpg
+*.json
 .env
 .pylintrc
+.idea
