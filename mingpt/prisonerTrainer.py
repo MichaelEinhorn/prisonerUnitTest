@@ -67,6 +67,7 @@ class PrisonerTrainer:
         C.cliprange = .2
         C.cliprange_value = .2
         C.vf_coef = .1
+        C.whiten = False
 
         return C
 
@@ -284,7 +285,8 @@ class PrisonerTrainer:
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
 
         returns = advantages + values_old
-        advantages = whiten(advantages)
+        if self.config.whiten:
+            advantages = whiten(advantages)
         advantages = advantages.detach()
 
         # computed batched before this method called
@@ -351,10 +353,12 @@ class PrisonerTrainer:
         actde_advantages = torch.stack(actde_advantages_reversed[::-1]).transpose(0, 1)
 
         returns = advantages + values_old
-        advantages = whiten(advantages)
+        if self.config.whiten:
+            advantages = whiten(advantages)
         advantages = advantages.detach()
 
-        actde_advantages = whiten(actde_advantages)
+        if self.config.whiten:
+            actde_advantages = whiten(actde_advantages)
         actde_advantages = actde_advantages.detach()
 
         # computed batched before this method called
