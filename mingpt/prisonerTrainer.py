@@ -32,6 +32,10 @@ def logprobs_from_logits(logits, labels):
     logpy = torch.gather(logp, 2, labels.unsqueeze(2)).squeeze(-1)
     return logpy
 
+def qidx_from_qs(qs, labels):
+    qidx = torch.gather(qs, -1, labels.unsqueeze(-1)).squeeze(-1)
+    return qidx
+
 def clip_by_value(x, tensor_min, tensor_max):
     """
     Tensor extenstion to torch.clamp
@@ -63,6 +67,8 @@ class PrisonerTrainer:
         C.cliprange = .2
         C.cliprange_value = .2
         C.vf_coef = .1
+        C.whiten = False
+        C.vf_loss_type = "ppo"
 
         return C
 
@@ -175,9 +181,10 @@ class PrisonerTrainer:
             # get the last generation from the model
             input_ids = input_ids[:, -1:]
             # generate 1 more to get next value. Prevents there from being a last game
-            input_ids, logits_old, values_old = model.generateLogits(input_ids, gen_len + 1, temperature=1.0, do_sample=True, top_k=None)
+            input_ids, logits_old, values_old, qs_old = model.generateLogits(input_ids, gen_len + 1, temperature=1.0, do_sample=True, top_k=None)
             logits_old = torch.stack(logits_old).transpose(0, 1)
             values_old = torch.stack(values_old).transpose(0, 1)
+            qs_old = torch.stack(qs_old).transpose(0, 1)
 
             rewards = self.payOffMat()[input_ids[:, 1:], input_ids[:, :-1]].to("cuda")
 
@@ -188,8 +195,10 @@ class PrisonerTrainer:
             rewards = rewards[:, :-1]
             values_next = values_old[:, -1, 0]
             values_old = values_old[:, :-1, 0]
+            qs_old = qs_old[:, :-1]
 
             old_logprobs = logprobs_from_logits(logits_old[:, :, :], input_ids[:, 1:])
+            q_old = qidx_from_qs(qs_old[:, :, :], input_ids[:, 1:])
 
 
             # rewards2 = self.scores(input_ids).to("cuda")
@@ -215,11 +224,13 @@ class PrisonerTrainer:
                     json.dump((iter_list, rew_dict, avg_rets, loss_list), file)
 
             for i in range(4):
-                logits, _, values = model(input_ids, outputVal=True)
+                logits, _, values, qs = model(input_ids, outputVal=True, outputQ=True)
                 if "ppo" in self.config.alg_name:
                     self.loss = self.ppoLoss(logits, values, old_logprobs, values_old, rewards, input_ids, gen_len, values_next, returns)
                 elif self.config.alg_name == "reject":
                     self.loss = self.rejectLoss(logits, values, old_logprobs, values_old, rewards, input_ids, gen_len, values_next, returns)
+                elif "actde" in self.config.alg_name:
+                    self.loss = self.actdeLoss(logits, values, qs, old_logprobs, values_old, q_old, rewards, input_ids, gen_len, values_next, returns)
                 # backprop and update the parameters
                 model.zero_grad(set_to_none=True)
                 self.loss.backward()
@@ -275,7 +286,8 @@ class PrisonerTrainer:
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
 
         returns = advantages + values_old
-        advantages = whiten(advantages)
+        if self.config.whiten:
+            advantages = whiten(advantages)
         advantages = advantages.detach()
 
         # computed batched before this method called
@@ -314,5 +326,99 @@ class PrisonerTrainer:
         pg_clipfrac = torch.mean(torch.gt(pg_losses2, pg_losses).double())
 
         loss = pg_loss + self.config.vf_coef * vf_loss
+
+        return loss
+
+    def actdeLoss(self, logits, vpred, qs, old_logprobs, values_old, old_q, rewards, input_ids, gen_len, values_next, returns_unused):
+        """Calculate policy and value losses."""
+        lastgaelam = torch.zeros(values_old.shape[0], device=values_old.device)
+        actde_lastgaelam = torch.zeros(values_old.shape[0], device=values_old.device)
+        advantages_reversed = []
+        actde_advantages_reversed = []
+
+        old_q = old_q[:, -gen_len:]
+        rewards = rewards[:, -gen_len:]
+        values_old = values_old[:, -gen_len:]
+
+        for t in reversed(range(gen_len)):
+            nextvalues = values_old[:, t + 1] if t < gen_len - 1 else values_next
+            delta = rewards[:, t] + self.config.gamma * nextvalues - values_old[:, t]
+            lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
+            advantages_reversed.append(lastgaelam)
+
+            actde_delta = rewards[:, t] + self.config.gamma * nextvalues - old_q[:, t]
+            actde_lastgaelam = actde_delta + self.config.gamma * self.config.lam * actde_lastgaelam
+            actde_advantages_reversed.append(actde_lastgaelam)
+
+        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+        actde_advantages = torch.stack(actde_advantages_reversed[::-1]).transpose(0, 1)
+
+        returns = advantages + values_old
+        if self.config.whiten:
+            advantages = whiten(advantages)
+        advantages = advantages.detach()
+
+        if self.config.whiten:
+            actde_advantages = whiten(actde_advantages)
+        actde_advantages = actde_advantages.detach()
+
+        # computed batched before this method called
+        # logits, vpred = self.forward(model_input, outputVals=True)
+
+        logprob = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
+
+        # only the generation part of the values/logprobs is needed
+        # both logits and values are shifted 1 left from the input
+        # start = querry_len - 1
+        # end = querry_len + gen_len - 1
+        # right pad
+        # logprob, vpred = logprob[:, start:end], vpred[:, start:end]
+        # left pad
+        # logits were already shifted
+        logprob, vpred = logprob[:, -gen_len:], vpred[:, -(gen_len + 1):-1, 0]
+        # logprob, vpred = logprob[:, total_len-gen_len:total_len], vpred[:, total_len-gen_len - 1:total_len-1]
+
+        vpredclipped = clip_by_value(vpred,
+                                     values_old - self.config.cliprange_value,
+                                     values_old + self.config.cliprange_value)
+
+        vpredclipped = clip_by_value(vpred,
+                                     values_old - self.config.cliprange_value,
+                                     values_old + self.config.cliprange_value)
+
+        
+        
+        q = qidx_from_qs(qs[:, :-1, :], input_ids[:, 1:])
+        q = q[:, -gen_len:]
+
+        q_loss = (q - returns) ** 2
+        q_loss = torch.mean(q_loss)
+
+        # ppo vf loss
+        if self.config.vf_loss_type == 'ppo':
+            vf_losses1 = (vpred - returns) ** 2
+            vf_losses2 = (vpredclipped - returns) ** 2
+            vf_loss = .5 * torch.mean(torch.max(vf_losses1, vf_losses2))
+            vf_clipfrac = torch.mean(torch.gt(vf_losses2, vf_losses1).double())
+        # ilql vf loss
+        elif self.config.vf_loss_type == 'ilql':
+            vf_loss = torch.mean(
+                (old_q >= vpred).int() * 0.9 * (old_q - vpred).pow(2)
+                + (old_q < vpred).int() * (1 - 0.9) * (old_q - vpred).pow(2)
+                )
+        else:
+            vf_loss = 0
+
+        ratio = torch.exp(logprob - old_logprobs)
+
+        pg_losses = -actde_advantages * ratio
+        pg_losses2 = -actde_advantages * torch.clamp(ratio,
+                                               1.0 - self.config.cliprange,
+                                               1.0 + self.config.cliprange)
+
+        pg_loss = torch.mean(torch.max(pg_losses, pg_losses2))
+        pg_clipfrac = torch.mean(torch.gt(pg_losses2, pg_losses).double())
+
+        loss = pg_loss + self.config.vf_coef * vf_loss + q_loss
 
         return loss

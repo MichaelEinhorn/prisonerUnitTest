@@ -111,6 +111,7 @@ class GPT(nn.Module):
         C.resid_pdrop = 0.1
         C.attn_pdrop = 0.1
         C.alg_name = None
+        C.detach_head = False # value head and q head
         return C
 
     def __init__(self, config):
@@ -154,6 +155,9 @@ class GPT(nn.Module):
 
         self.valueHead = nn.Linear(config.n_embd, 1)
         self.alg_name = config.alg_name
+
+        self.qHead = nn.Linear(config.n_embd, config.vocab_size)
+        self.detach_head = config.detach_head
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -262,7 +266,7 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None, outputVal=False):
+    def forward(self, idx, targets=None, outputVal=False, outputQ=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -283,10 +287,15 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         if outputVal:
-            if "detached" in self.alg_name:
+            if self.detach_head:
                 x = x.detach()
+
             value = self.valueHead(x)
-            return logits, loss, value
+            if outputQ:
+                q = self.qHead(x)
+                return logits, loss, value, q
+            else:
+                return logits, loss, value
         else:
             return logits, loss
 
@@ -329,14 +338,16 @@ class GPT(nn.Module):
         """
         logitsList = []
         valuesList = []
+        qList = []
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, value = self(idx_cond, outputVal=True)
+            logits, _, value, q = self(idx_cond, outputVal=True, outputQ=True)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             value = value[:, -1, :]
+            q = q[:, -1, :]
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
@@ -344,6 +355,7 @@ class GPT(nn.Module):
 
             logitsList.append(logits)
             valuesList.append(value)
+            qList.append(q)
 
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
@@ -355,4 +367,4 @@ class GPT(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx, logitsList, valuesList
+        return idx, logitsList, valuesList, qList
