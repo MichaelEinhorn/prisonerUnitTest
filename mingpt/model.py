@@ -111,6 +111,7 @@ class GPT(nn.Module):
         C.resid_pdrop = 0.1
         C.attn_pdrop = 0.1
         C.alg_name = None
+        C.detach_head = False # value head and q head
         return C
 
     def __init__(self, config):
@@ -156,6 +157,7 @@ class GPT(nn.Module):
         self.alg_name = config.alg_name
 
         self.qHead = nn.Linear(config.n_embd, config.vocab_size)
+        self.detach_head = config.detach_head
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -285,8 +287,9 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         if outputVal:
-            if "detached" in self.alg_name:
+            if self.detach_head:
                 x = x.detach()
+
             value = self.valueHead(x)
             if outputQ:
                 q = self.qHead(x)

@@ -68,6 +68,7 @@ class PrisonerTrainer:
         C.cliprange_value = .2
         C.vf_coef = .1
         C.whiten = False
+        C.vf_loss_type = "ppo"
 
         return C
 
@@ -394,17 +395,19 @@ class PrisonerTrainer:
         q_loss = torch.mean(q_loss)
 
         # ppo vf loss
-        if True:
+        if self.config.vf_loss_type == 'ppo':
             vf_losses1 = (vpred - returns) ** 2
             vf_losses2 = (vpredclipped - returns) ** 2
             vf_loss = .5 * torch.mean(torch.max(vf_losses1, vf_losses2))
             vf_clipfrac = torch.mean(torch.gt(vf_losses2, vf_losses1).double())
         # ilql vf loss
-        else:
+        elif self.config.vf_loss_type == 'ilql':
             vf_loss = torch.mean(
                 (old_q >= vpred).int() * 0.9 * (old_q - vpred).pow(2)
                 + (old_q < vpred).int() * (1 - 0.9) * (old_q - vpred).pow(2)
                 )
+        else:
+            vf_loss = 0
 
         ratio = torch.exp(logprob - old_logprobs)
 
