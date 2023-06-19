@@ -122,6 +122,9 @@ class PrisonerTrainer:
         #        [1, -0.224745]]
         # mat = [[0.5, -1.20718],
         #        [0.7, 0.00717968]]
+        # extreme value discount threshold 0.75
+        # mat = [[-0.0294 * 4, -0.2647 * 4],
+        #        [0.5 * 4, -0.2059 * 4]]
 
         return torch.tensor(mat)
 
@@ -138,24 +141,28 @@ class PrisonerTrainer:
         return gamma
 
     # reward x
-    def payOffMatEx(self, x, y):
-        # row is x's choice
-        # column is y's choice
-        # 0 is defect, 1 is coop
-        mat = [[0.5, -1],
-               [1,   0]]
+    # def payOffMatEx(self, x, y):
+    #     # row is x's choice
+    #     # column is y's choice
+    #     # 0 is defect, 1 is coop
+    #     mat = [[0.5, -1],
+    #            [1,   0]]
 
-        return mat[x][y]
+    #     return mat[x][y]
 
-    def scores(self, seq):
-        score = torch.zeros((seq.shape[0], seq.shape[1] - 1))
-        for b in range(seq.shape[0]):
-            for i in range(1, seq.shape[1]):
-                score[b, i-1] = self.payOffMatEx(seq[b, i], seq[b, i-1])
-        return score
+    def getRewards(self, input_ids):
+        rewards = self.payOffMat()[input_ids[:, 1:], input_ids[:, :-1]]
+        return rewards
+    
+    def discountSum(self, score, gamma_):
+        factor = 1
+        returns = torch.zeros(score.shape[0])
+        for i in range(score.shape[1]):
+            returns += factor * score[:, i]
+            factor *= gamma_
+        return returns
 
-
-    def run(self):
+    def run(self, model_filename=None, stats_filename="rewStats.json"):
         model, config = self.model, self.config
 
         rew_dict = {}
@@ -220,7 +227,9 @@ class PrisonerTrainer:
                 for i in range(out.shape[0]):
                     rew_dict[out[i].detach().to("cpu").item()][-1] = count[i].detach().to("cpu").item()
                 avg_rets.append(torch.mean(returns).detach().to("cpu").item())
-                with open("rewStats.json", 'w') as file:
+                
+                # save
+                with open("stats/" + stats_filename, 'w') as file:
                     json.dump((iter_list, rew_dict, avg_rets, loss_list), file)
 
             for i in range(4):
@@ -247,6 +256,8 @@ class PrisonerTrainer:
             # termination conditions
             if config.max_iters is not None and self.iter_num >= config.max_iters:
                 break
+        if model_filename is not None:
+            torch.save(model.state_dict(), "models/" + model_filename)
 
     def rejectLoss(self, logits, vpred, old_logprobs, values_old, rewards, input_ids, gen_len, values_next, returns):
         returns = rewards.clone()
